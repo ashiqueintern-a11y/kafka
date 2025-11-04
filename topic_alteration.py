@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Kafka Topic Alteration Script with Pre-checks
+Kafka Topic Alteration Script with OpenTSDB Integration
 
 Production-grade script for safely altering Kafka topics with comprehensive
-validation and automated execution.
+validation and automated execution. Uses OpenTSDB for disk usage monitoring
+with automatic path detection from kafka-log-dirs.sh.
 
 Usage: python kafka_topic_alter.py --config config.yaml [--dry-run]
 """
@@ -19,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import yaml
+import requests
 
 
 # ==============================================================================
@@ -109,6 +111,14 @@ class Config:
         elif not any(k in config['alteration'] for k in ['partitions', 'retention', 'other_configs']):
             errors.append("No alterations specified")
         
+        # OpenTSDB configuration is now REQUIRED
+        if 'opentsdb' not in config:
+            errors.append("Missing 'opentsdb' section - OpenTSDB is required for disk monitoring")
+        else:
+            if 'url' not in config['opentsdb']:
+                errors.append("Missing opentsdb.url")
+            # disk_mount_path is optional - will be auto-detected from kafka-log-dirs.sh
+        
         if errors:
             for error in errors:
                 self.logger.error(f"  - {error}")
@@ -165,6 +175,112 @@ class Config:
     @property
     def alterations(self) -> Dict:
         return self.data.get('alteration', {})
+    
+    @property
+    def opentsdb_config(self) -> Optional[Dict]:
+        """Get OpenTSDB configuration if present."""
+        return self.data.get('opentsdb')
+
+
+# ==============================================================================
+# OPENTSDB CLIENT
+# ==============================================================================
+
+class OpenTSDBClient:
+    """Client for querying OpenTSDB metrics."""
+    
+    def __init__(self, url: str, logger: logging.Logger, timeout: int = 10):
+        """
+        Initialize OpenTSDB client.
+        
+        Args:
+            url: OpenTSDB API endpoint (e.g., http://opentsdb-read.example.com)
+            logger: Logger instance
+            timeout: Request timeout in seconds
+        """
+        # Automatically append /api/query if not present
+        if not url.endswith('/api/query'):
+            url = url.rstrip('/') + '/api/query'
+        
+        self.url = url
+        self.logger = logger
+        self.timeout = timeout
+        self.logger.debug(f"OpenTSDB URL: {self.url}")
+    
+    def query_disk_usage(self, node_host: str, path: str, 
+                        time_range: str = "5m-ago") -> Optional[float]:
+        """
+        Query disk usage percentage for a specific node and path.
+        
+        Args:
+            node_host: Hostname (e.g., 'stg-hdpashique101.phonepe.nb6')
+            path: Mount path (e.g., '/data')
+            time_range: Time range for query (default: '5m-ago')
+            
+        Returns:
+            Latest disk usage percentage, or None if query fails
+        """
+        payload = {
+            "start": time_range,
+            "queries": [
+                {
+                    "metric": "disk.field.used_percent",
+                    "aggregator": "avg",
+                    "tags": {
+                        "node_host": node_host,
+                        "path": path
+                    }
+                }
+            ]
+        }
+        
+        try:
+            self.logger.debug(f"Querying OpenTSDB for {node_host}:{path}")
+            response = requests.post(
+                self.url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=self.timeout
+            )
+            
+            response.raise_for_status()
+            
+            # Log response for debugging
+            self.logger.debug(f"OpenTSDB response status: {response.status_code}")
+            self.logger.debug(f"OpenTSDB response length: {len(response.text)} bytes")
+            
+            data = response.json()
+            
+            if not data or not isinstance(data, list) or len(data) == 0:
+                self.logger.warning(f"No data returned from OpenTSDB for {node_host}:{path}")
+                return None
+            
+            # Get the most recent data point
+            result = data[0]
+            dps = result.get('dps', {})
+            
+            if not dps:
+                self.logger.warning(f"No data points in OpenTSDB response for {node_host}:{path}")
+                return None
+            
+            # Get the latest timestamp's value
+            latest_timestamp = max(dps.keys())
+            usage_percent = dps[latest_timestamp]
+            
+            self.logger.debug(f"OpenTSDB: {node_host}:{path} = {usage_percent:.2f}%")
+            return float(usage_percent)
+            
+        except requests.exceptions.Timeout:
+            self.logger.error(f"OpenTSDB query timeout for {node_host}:{path}")
+            return None
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"OpenTSDB query failed for {node_host}:{path}: {e}")
+            return None
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            self.logger.error(f"Failed to parse OpenTSDB response for {node_host}:{path}: {e}")
+            self.logger.debug(f"OpenTSDB URL: {self.url}")
+            self.logger.debug(f"Response text (first 500 chars): {response.text[:500] if 'response' in locals() else 'N/A'}")
+            return None
 
 
 # ==============================================================================
@@ -174,11 +290,19 @@ class Config:
 class KafkaCLI:
     """Wrapper for Kafka CLI tools."""
     
-    def __init__(self, bootstrap_servers: List[str], logger: logging.Logger, kafka_home: Optional[str] = None):
+    def __init__(self, bootstrap_servers: List[str], logger: logging.Logger, 
+                 kafka_home: Optional[str] = None, opentsdb_client: Optional[OpenTSDBClient] = None,
+                 disk_mount_path: str = "/data"):
         self.bootstrap = ','.join(bootstrap_servers)
         self.logger = logger
         self.bin_path = self._find_kafka_bin(kafka_home)
+        self.opentsdb_client = opentsdb_client
+        self.disk_mount_path = disk_mount_path
         self.logger.info(f"Using Kafka tools: {self.bin_path or 'from PATH'}")
+        
+        if self.opentsdb_client:
+            self.logger.info(f"OpenTSDB integration enabled for disk usage monitoring")
+            self.logger.info(f"Monitoring disk path: {self.disk_mount_path}")
     
     def _find_kafka_bin(self, kafka_home: Optional[str]) -> str:
         """Find Kafka bin directory."""
@@ -293,6 +417,118 @@ class KafkaCLI:
         except Exception as e:
             self.logger.error(f"✗ Connection failed: {e}")
             return False
+    
+    def get_broker_hosts(self) -> List[str]:
+        """
+        Extract broker hostnames from bootstrap servers.
+        Converts 'hostname:port' to 'hostname'.
+        
+        Returns:
+            List of broker hostnames
+        """
+        hosts = []
+        for server in self.bootstrap.split(','):
+            # Extract hostname (before the colon if port is present)
+            host = server.split(':')[0].strip()
+            hosts.append(host)
+        return hosts
+    
+    def get_broker_id_to_host_mapping(self) -> Dict[int, str]:
+        """
+        Get mapping from broker ID to hostname by parsing kafka-broker-api-versions.sh output.
+        
+        Returns:
+            Dict mapping broker ID to hostname
+            Example: {1: 'broker1.example.com', 2: 'broker2.example.com'}
+        """
+        self.logger.debug("Getting broker ID to hostname mapping...")
+        
+        try:
+            _, output, _ = self._run([
+                self._tool('kafka-broker-api-versions.sh'),
+                '--bootstrap-server', self.bootstrap
+            ])
+            
+            broker_mapping = {}
+            
+            # Parse output for broker info
+            # Format: hostname:port (id: X rack: Y) -> ...
+            for line in output.split('\n'):
+                if '(id:' in line:
+                    # Extract hostname and broker ID
+                    match = re.match(r'([^:]+):\d+\s+\(id:\s*(\d+)', line)
+                    if match:
+                        hostname = match.group(1).strip()
+                        broker_id = int(match.group(2))
+                        broker_mapping[broker_id] = hostname
+                        self.logger.debug(f"Broker {broker_id} -> {hostname}")
+            
+            if broker_mapping:
+                self.logger.debug(f"Found {len(broker_mapping)} broker mappings")
+                return broker_mapping
+            
+        except Exception as e:
+            self.logger.debug(f"Could not get broker mapping via API versions: {e}")
+        
+        # Fallback: Use bootstrap servers in order
+        self.logger.debug("Falling back to bootstrap server order for broker mapping")
+        broker_hosts = self.get_broker_hosts()
+        return {i: host for i, host in enumerate(broker_hosts, 1)}
+    
+    def get_broker_log_dirs(self) -> Dict[str, List[str]]:
+        """
+        Get log directory paths for each broker from kafka-log-dirs.sh.
+        This provides the actual disk paths that Kafka is using.
+        
+        Returns:
+            Dict mapping broker_id to list of log directory paths
+            Example: {1: ['/data/kafka'], 2: ['/data/kafka', '/data2/kafka']}
+        """
+        self.logger.debug("Fetching broker log directories from kafka-log-dirs.sh...")
+        
+        try:
+            _, output, _ = self._run([
+                self._tool('kafka-log-dirs.sh'),
+                '--bootstrap-server', self.bootstrap,
+                '--describe'
+            ])
+            
+            # Find JSON in output
+            json_start = output.find('{')
+            if json_start == -1:
+                self.logger.warning("Could not parse kafka-log-dirs.sh output for log paths")
+                return {}
+            
+            json_output = output[json_start:]
+            data = json.loads(json_output)
+            
+            broker_log_dirs = {}
+            
+            for broker_data in data.get('brokers', []):
+                broker_id = broker_data.get('broker')
+                log_dirs = []
+                
+                for log_dir_data in broker_data.get('logDirs', []):
+                    log_dir = log_dir_data.get('logDir')
+                    if log_dir and not log_dir_data.get('error'):
+                        # Extract the mount point (e.g., '/data' from '/data/kafka')
+                        # Typically the first two path components
+                        parts = log_dir.split('/')
+                        if len(parts) >= 2:
+                            # Get mount point - typically /data, /data1, etc.
+                            mount_point = '/' + parts[1] if parts[1] else log_dir
+                            if mount_point not in log_dirs:
+                                log_dirs.append(mount_point)
+                
+                if log_dirs:
+                    broker_log_dirs[broker_id] = log_dirs
+                    self.logger.debug(f"Broker {broker_id} log dirs: {log_dirs}")
+            
+            return broker_log_dirs
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to get broker log directories: {e}")
+            return {}
     
     def get_topic_info(self, topic: str) -> Optional[Dict]:
         """Get topic information."""
@@ -415,267 +651,93 @@ class KafkaCLI:
     
     def get_disk_usage(self) -> Tuple[float, Dict]:
         """
-        Check disk space using kafka-log-dirs.sh.
-        Parses JSON output and calculates disk usage per broker.
-        Returns highest disk usage across all brokers.
+        Check disk usage using OpenTSDB only.
         
         Returns:
             Tuple of (max_usage_percentage, disk_info_dict)
         """
-        self.logger.info("Checking disk usage via kafka-log-dirs.sh...")
+        if not self.opentsdb_client:
+            self.logger.error("OpenTSDB is not configured. Cannot check disk usage.")
+            self.logger.error("Please configure OpenTSDB in your config file.")
+            return 0.0, {}
         
-        try:
-            _, output, _ = self._run([
-                self._tool('kafka-log-dirs.sh'),
-                '--bootstrap-server', self.bootstrap,
-                '--describe'
-            ])
+        return self._get_disk_usage_opentsdb()
+    
+    def _get_disk_usage_opentsdb(self) -> Tuple[float, Dict]:
+        """
+        Check disk usage using OpenTSDB metrics.
+        Queries each broker's actual log directory paths (from kafka-log-dirs.sh).
+        
+        Returns:
+            Tuple of (max_usage_percentage, disk_info_dict)
+        """
+        self.logger.info("Checking disk usage via OpenTSDB...")
+        
+        # Get broker ID to hostname mapping
+        host_mapping = self.get_broker_id_to_host_mapping()
+        
+        # Get the actual log directory paths from Kafka
+        broker_log_dirs = self.get_broker_log_dirs()
+        
+        if not broker_log_dirs:
+            self.logger.warning("Could not determine broker log directories from kafka-log-dirs.sh")
+            self.logger.info(f"Falling back to configured path: {self.disk_mount_path}")
+            # Fallback to using all known brokers with configured path
+            broker_log_dirs = {broker_id: [self.disk_mount_path] for broker_id in host_mapping.keys()}
+        
+        if not broker_log_dirs:
+            self.logger.warning("No brokers found to query")
+            return 0.0, {}
+        
+        max_usage = 0.0
+        disk_info = {}
+        broker_stats = []
+        
+        # Query each broker's log directories
+        for broker_id, log_dirs in broker_log_dirs.items():
+            broker_host = host_mapping.get(broker_id, f"broker-{broker_id}")
             
-            # kafka-log-dirs.sh may output warnings/info before JSON
-            # Find the first '{' character to start parsing JSON
-            json_start = output.find('{')
-            if json_start == -1:
-                self.logger.warning("No JSON found in kafka-log-dirs.sh output")
-                self.logger.debug(f"Output: {output[:500]}")
-                return 0.0, {}
-            
-            # Extract only the JSON part
-            json_output = output[json_start:]
-            
-            # Parse JSON output
-            data = json.loads(json_output)
-            
-            max_usage = 0.0
-            disk_info = {}
-            broker_stats = []
-            
-            # Iterate through brokers
-            for broker_data in data.get('brokers', []):
-                broker_id = broker_data.get('broker')
-                log_dirs = broker_data.get('logDirs', [])
+            for log_dir in log_dirs:
+                usage_pct = self.opentsdb_client.query_disk_usage(broker_host, log_dir)
                 
-                for log_dir_data in log_dirs:
-                    log_dir = log_dir_data.get('logDir')
-                    
-                    # Check for errors
-                    if log_dir_data.get('error'):
-                        self.logger.warning(f"⚠ Error on broker {broker_id} log dir {log_dir}: {log_dir_data.get('error')}")
-                        continue
-                    
-                    # Calculate total size used by summing all partition sizes
-                    partitions = log_dir_data.get('partitions', [])
-                    total_used_bytes = sum(p.get('size', 0) for p in partitions)
-                    
-                    # Get total and usable bytes (if available in newer Kafka versions)
-                    total_bytes = log_dir_data.get('totalBytes')
-                    usable_bytes = log_dir_data.get('usableBytes')
-                    
-                    # Calculate usage percentage
-                    if total_bytes and total_bytes > 0:
-                        # If totalBytes is available (Kafka 2.6+)
-                        used_bytes = total_bytes - (usable_bytes or 0)
-                        used_pct = (used_bytes / total_bytes) * 100
-                        free_gb = (usable_bytes or 0) / (1024**3)
-                        total_gb = total_bytes / (1024**3)
-                        kafka_data_gb = total_used_bytes / (1024**3)
-                    else:
-                        # Fallback: Only show Kafka data size
-                        # We can't calculate percentage without totalBytes
-                        kafka_data_gb = total_used_bytes / (1024**3)
-                        
-                        # Try to get disk stats using statvfs if we're on local broker
-                        try:
-                            if os.path.exists(log_dir):
-                                stat = os.statvfs(log_dir)
-                                free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
-                                total_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
-                                used_bytes = total_gb * (1024**3) - free_gb * (1024**3)
-                                used_pct = (used_bytes / (total_gb * (1024**3))) * 100 if total_gb > 0 else 0
-                            else:
-                                # Can't determine disk usage
-                                self.logger.debug(f"Cannot access {log_dir} locally, skipping disk usage calculation")
-                                free_gb = None
-                                total_gb = None
-                                used_pct = 0
-                        except Exception as e:
-                            self.logger.debug(f"statvfs failed for {log_dir}: {e}")
-                            free_gb = None
-                            total_gb = None
-                            used_pct = 0
-                    
-                    broker_stat = {
-                        'broker': broker_id,
-                        'path': log_dir,
-                        'kafka_data_gb': kafka_data_gb,
-                        'usage_pct': used_pct if used_pct else 0,
-                        'free_gb': free_gb,
-                        'total_gb': total_gb
-                    }
-                    broker_stats.append(broker_stat)
-                    
-                    # Log broker disk info
-                    if free_gb is not None and total_gb is not None:
-                        self.logger.info(
-                            f"Broker {broker_id}: {log_dir} - "
-                            f"Kafka data: {kafka_data_gb:.2f}GB | "
-                            f"Disk: {free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_pct:.1f}% used)"
-                        )
-                    else:
-                        self.logger.info(
-                            f"Broker {broker_id}: {log_dir} - "
-                            f"Kafka data: {kafka_data_gb:.2f}GB"
-                        )
-                    
-                    # Track max usage
-                    if used_pct > max_usage:
-                        max_usage = used_pct
-                        disk_info = broker_stat
-                    
-                    # Warnings based on disk usage percentage
-                    if used_pct > 0:
-                        if used_pct >= 85:
-                            self.logger.warning(
-                                f"⚠ HIGH DISK USAGE: {used_pct:.1f}% on broker {broker_id} at {log_dir}"
-                            )
-                        if free_gb is not None and free_gb < 10:
-                            self.logger.warning(
-                                f"⚠ LOW DISK SPACE: {free_gb:.1f}GB free on broker {broker_id} at {log_dir}"
-                            )
-            
-            if not broker_stats:
-                self.logger.warning("Could not determine disk usage from kafka-log-dirs.sh")
-                return 0.0, {}
-            
-            if max_usage > 0:
-                self.logger.info(f"Highest disk usage: {max_usage:.1f}% on broker {disk_info.get('broker')}")
-            else:
-                self.logger.info("Disk usage data collected for all brokers")
-            
-            return max_usage, disk_info
-            
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to parse kafka-log-dirs.sh JSON output: {e}")
-            self.logger.debug(f"Output was: {output[:500] if 'output' in locals() else 'N/A'}")
-            return 0.0, {}
-        except Exception as e:
-            self.logger.error(f"Failed to check disk usage: {e}")
-            return 0.0, {}
-            
-            max_usage = 0.0
-            disk_info = {}
-            broker_stats = []
-            
-            # Iterate through brokers
-            for broker_data in data.get('brokers', []):
-                broker_id = broker_data.get('broker')
-                log_dirs = broker_data.get('logDirs', [])
+                if usage_pct is None:
+                    self.logger.warning(f"⚠ Could not get disk usage for broker {broker_id} ({broker_host}:{log_dir})")
+                    continue
                 
-                for log_dir_data in log_dirs:
-                    log_dir = log_dir_data.get('logDir')
-                    
-                    # Check for errors
-                    if log_dir_data.get('error'):
-                        self.logger.warning(f"⚠ Error on broker {broker_id} log dir {log_dir}: {log_dir_data.get('error')}")
-                        continue
-                    
-                    # Calculate total size used by summing all partition sizes
-                    partitions = log_dir_data.get('partitions', [])
-                    total_used_bytes = sum(p.get('size', 0) for p in partitions)
-                    
-                    # Get total and usable bytes (if available in newer Kafka versions)
-                    total_bytes = log_dir_data.get('totalBytes')
-                    usable_bytes = log_dir_data.get('usableBytes')
-                    
-                    # Calculate usage percentage
-                    if total_bytes and total_bytes > 0:
-                        # If totalBytes is available (Kafka 2.6+)
-                        used_bytes = total_bytes - (usable_bytes or 0)
-                        used_pct = (used_bytes / total_bytes) * 100
-                        free_gb = (usable_bytes or 0) / (1024**3)
-                        total_gb = total_bytes / (1024**3)
-                        kafka_data_gb = total_used_bytes / (1024**3)
-                    else:
-                        # Fallback: Only show Kafka data size
-                        # We can't calculate percentage without totalBytes
-                        kafka_data_gb = total_used_bytes / (1024**3)
-                        
-                        # Try to get disk stats using statvfs if we're on local broker
-                        try:
-                            if os.path.exists(log_dir):
-                                stat = os.statvfs(log_dir)
-                                free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
-                                total_gb = (stat.f_blocks * stat.f_frsize) / (1024**3)
-                                used_bytes = total_gb * (1024**3) - free_gb * (1024**3)
-                                used_pct = (used_bytes / (total_gb * (1024**3))) * 100 if total_gb > 0 else 0
-                            else:
-                                # Can't determine disk usage
-                                self.logger.debug(f"Cannot access {log_dir} locally, skipping disk usage calculation")
-                                free_gb = None
-                                total_gb = None
-                                used_pct = 0
-                        except Exception as e:
-                            self.logger.debug(f"statvfs failed for {log_dir}: {e}")
-                            free_gb = None
-                            total_gb = None
-                            used_pct = 0
-                    
-                    broker_stat = {
-                        'broker': broker_id,
-                        'path': log_dir,
-                        'kafka_data_gb': kafka_data_gb,
-                        'usage_pct': used_pct if used_pct else 0,
-                        'free_gb': free_gb,
-                        'total_gb': total_gb
-                    }
-                    broker_stats.append(broker_stat)
-                    
-                    # Log broker disk info
-                    if free_gb is not None and total_gb is not None:
-                        self.logger.info(
-                            f"Broker {broker_id}: {log_dir} - "
-                            f"Kafka data: {kafka_data_gb:.2f}GB | "
-                            f"Disk: {free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_pct:.1f}% used)"
-                        )
-                    else:
-                        self.logger.info(
-                            f"Broker {broker_id}: {log_dir} - "
-                            f"Kafka data: {kafka_data_gb:.2f}GB"
-                        )
-                    
-                    # Track max usage
-                    if used_pct > max_usage:
-                        max_usage = used_pct
-                        disk_info = broker_stat
-                    
-                    # Warnings based on disk usage percentage
-                    if used_pct > 0:
-                        if used_pct >= 85:
-                            self.logger.warning(
-                                f"⚠ HIGH DISK USAGE: {used_pct:.1f}% on broker {broker_id} at {log_dir}"
-                            )
-                        if free_gb is not None and free_gb < 10:
-                            self.logger.warning(
-                                f"⚠ LOW DISK SPACE: {free_gb:.1f}GB free on broker {broker_id} at {log_dir}"
-                            )
-            
-            if not broker_stats:
-                self.logger.warning("Could not determine disk usage from kafka-log-dirs.sh")
-                return 0.0, {}
-            
-            if max_usage > 0:
-                self.logger.info(f"Highest disk usage: {max_usage:.1f}% on broker {disk_info.get('broker')}")
-            else:
-                self.logger.info("Disk usage data collected for all brokers")
-            
-            return max_usage, disk_info
-            
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to parse kafka-log-dirs.sh JSON output: {e}")
-            self.logger.debug(f"Output was: {output[:500]}")
+                broker_stat = {
+                    'broker': broker_id,
+                    'host': broker_host,
+                    'path': log_dir,
+                    'usage_pct': usage_pct
+                }
+                broker_stats.append(broker_stat)
+                
+                # Log broker disk info
+                self.logger.info(f"Broker {broker_id} ({broker_host}): {log_dir} - {usage_pct:.2f}% used")
+                
+                # Track max usage
+                if usage_pct > max_usage:
+                    max_usage = usage_pct
+                    disk_info = broker_stat
+                
+                # Warnings based on disk usage percentage
+                if usage_pct >= 85:
+                    self.logger.warning(
+                        f"⚠ HIGH DISK USAGE: {usage_pct:.2f}% on broker {broker_id} ({broker_host}) at {log_dir}"
+                    )
+                elif usage_pct >= 80:
+                    self.logger.warning(
+                        f"⚠ ELEVATED DISK USAGE: {usage_pct:.2f}% on broker {broker_id} ({broker_host}) at {log_dir}"
+                    )
+        
+        if not broker_stats:
+            self.logger.warning("Could not determine disk usage from OpenTSDB")
             return 0.0, {}
-        except Exception as e:
-            self.logger.error(f"Failed to check disk usage: {e}")
-            return 0.0, {}
+        
+        host_or_broker = disk_info.get('host', disk_info.get('broker', 'unknown'))
+        self.logger.info(f"Highest disk usage: {max_usage:.2f}% on broker {disk_info.get('broker')} ({host_or_broker}) at {disk_info.get('path')}")
+        
+        return max_usage, disk_info
     
     def alter_partitions(self, topic: str, count: int, dry_run: bool) -> bool:
         """Alter partition count."""
@@ -774,9 +836,9 @@ class PreChecks:
         disk_usage, disk_info = self.kafka.get_disk_usage()
         
         if disk_usage >= 80.0:
-            broker = disk_info.get('broker', 'unknown')
+            host_or_broker = disk_info.get('host') or disk_info.get('broker', 'unknown')
             path = disk_info.get('path', 'unknown')
-            self.errors.append(f"Disk usage ({disk_usage:.1f}%) >= 80% on broker {broker} at {path}")
+            self.errors.append(f"Disk usage ({disk_usage:.1f}%) >= 80% on {host_or_broker} at {path}")
             self.logger.error(f"✗ High disk usage: {disk_usage:.1f}%")
             return False
         
@@ -824,10 +886,10 @@ class PreChecks:
             else:
                 disk_usage, disk_info = self.kafka.get_disk_usage()
                 if disk_usage >= 70.0:
-                    broker = disk_info.get('broker', 'unknown')
+                    host_or_broker = disk_info.get('host') or disk_info.get('broker', 'unknown')
                     path = disk_info.get('path', 'unknown')
                     self.warnings.append(
-                        f"Disk at {disk_usage:.1f}% on broker {broker} at {path} with retention increase"
+                        f"Disk at {disk_usage:.1f}% on {host_or_broker} at {path} with retention increase"
                     )
                     self.logger.warning(f"⚠ High disk usage with retention increase")
         
@@ -856,7 +918,41 @@ class TopicAlterator:
         self.logger = logger
         self.snapshot_dir = snapshot_dir
         self.config = Config(config_path, logger)
-        self.kafka = KafkaCLI(self.config.bootstrap_servers, logger, self.config.kafka_home)
+        
+        # Initialize OpenTSDB client (REQUIRED)
+        opentsdb_client = None
+        disk_mount_path = "/data"  # Default fallback
+        
+        if not self.config.opentsdb_config:
+            logger.error("=" * 80)
+            logger.error("OpenTSDB configuration is REQUIRED")
+            logger.error("Please add 'opentsdb' section to your config file")
+            logger.error("=" * 80)
+            sys.exit(1)
+        
+        opentsdb_url = self.config.opentsdb_config.get('url')
+        if not opentsdb_url:
+            logger.error("OpenTSDB URL is required")
+            sys.exit(1)
+        
+        disk_mount_path = self.config.opentsdb_config.get('disk_mount_path', '/data')
+        timeout = self.config.opentsdb_config.get('timeout', 10)
+        
+        opentsdb_client = OpenTSDBClient(opentsdb_url, logger, timeout)
+        logger.info(f"✓ OpenTSDB client initialized: {opentsdb_url}")
+        if self.config.opentsdb_config.get('disk_mount_path'):
+            logger.info(f"✓ Using configured disk path: {disk_mount_path}")
+        else:
+            logger.info(f"✓ Disk paths will be auto-detected from kafka-log-dirs.sh")
+            logger.info(f"✓ Fallback path (if auto-detect fails): {disk_mount_path}")
+        
+        self.kafka = KafkaCLI(
+            self.config.bootstrap_servers, 
+            logger, 
+            self.config.kafka_home,
+            opentsdb_client,
+            disk_mount_path
+        )
         self.checks = PreChecks(self.kafka, self.config, logger)
     
     def run(self) -> bool:
@@ -1050,14 +1146,14 @@ class TopicAlterator:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Kafka Topic Alteration Script with Pre-checks',
+        description='Kafka Topic Alteration Script with Pre-checks and OpenTSDB Integration',
         epilog='Example: python kafka_topic_alter.py --config config.yaml --dry-run'
     )
     parser.add_argument('--config', required=True, help='YAML configuration file')
     parser.add_argument('--dry-run', action='store_true', help='Simulate without making changes')
     parser.add_argument('--snapshot-dir', default='/home/sre/snapshot', 
                        help='Directory to save configuration snapshots (default: /home/sre/snapshot)')
-    parser.add_argument('--version', action='version', version='v2.0.0')
+    parser.add_argument('--version', action='version', version='v2.3.0-opentsdb-only')
     
     args = parser.parse_args()
     logger = setup_logging()
