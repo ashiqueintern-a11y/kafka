@@ -175,14 +175,21 @@ def get_broker_id_from_hostname(hostname: str, kafka_bin: str, bootstrap_servers
 
 
 def get_broker_disk_usage_from_kafka(kafka_bin: str, bootstrap_servers: str, 
-                                      logger: logging.Logger) -> Dict[int, Dict[str, float]]:
-    """Get disk usage for all brokers using kafka-log-dirs.sh."""
+                                      logger: logging.Logger) -> Tuple[Dict[int, Dict[str, float]], Dict[int, List[str]]]:
+    """
+    Get disk usage for all brokers using kafka-log-dirs.sh.
+    
+    Returns:
+        Tuple of (broker_usage_dict, broker_log_dirs_dict)
+        - broker_usage_dict: {broker_id: {total_bytes, usage_gb, usage_percent}}
+        - broker_log_dirs_dict: {broker_id: [list of log directories]}
+    """
     try:
         cmd = [f"{kafka_bin}/kafka-log-dirs.sh", "--describe", "--bootstrap-server", bootstrap_servers]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
-            return {}
+            return {}, {}
         
         json_line = None
         for line in result.stdout.strip().split('\n'):
@@ -191,16 +198,27 @@ def get_broker_disk_usage_from_kafka(kafka_bin: str, bootstrap_servers: str,
                 break
         
         if not json_line:
-            return {}
+            return {}, {}
         
         data = json.loads(json_line)
         broker_usage = {}
+        broker_log_dirs = {}
         
         for broker_obj in data.get('brokers', []):
             broker_id = broker_obj.get('broker')
             if broker_id is None:
                 continue
             
+            # Collect log directories for this broker
+            log_dirs = []
+            for log_dir in broker_obj.get('logDirs', []):
+                log_dir_path = log_dir.get('logDir')
+                if log_dir_path:
+                    log_dirs.append(log_dir_path)
+            
+            broker_log_dirs[broker_id] = log_dirs
+            
+            # Calculate total usage
             total_bytes = sum(
                 partition.get('size', 0)
                 for log_dir in broker_obj.get('logDirs', [])
@@ -213,11 +231,11 @@ def get_broker_disk_usage_from_kafka(kafka_bin: str, bootstrap_servers: str,
                 'usage_percent': 0.0
             }
         
-        return broker_usage
+        return broker_usage, broker_log_dirs
         
     except Exception as e:
         logger.error(f"Error getting broker disk usage: {e}")
-        return {}
+        return {}, {}
 
 
 # ==============================================================================
@@ -323,11 +341,19 @@ class KafkaConfig:
             'isr_sync_timeout': 600,
             'isr_check_interval': 10,
             'verification_interval': 10,
-            'reassignment_timeout': 300
+            'reassignment_timeout': 300,
+            'ambari_timeout': 300
         }
         
         for key, default_value in defaults.items():
             self.config.setdefault(key, default_value)
+        
+        # Validate Ambari configuration (now mandatory)
+        ambari_required = ['ambari_host', 'ambari_user', 'ambari_password', 'ambari_cluster']
+        missing_ambari = [field for field in ambari_required if not self.config.get(field)]
+        if missing_ambari:
+            raise ValueError(f"Missing required Ambari configuration fields: {missing_ambari}")
+        self.logger.info("✓ Ambari configuration validated")
         
         self.logger.info("✓ Configuration validation passed")
     
@@ -340,96 +366,300 @@ class KafkaConfig:
 # ==============================================================================
 
 class BrokerManager:
-    """Manage local broker start/stop operations."""
+    """Manage broker start/stop operations via Ambari API only."""
     
-    def __init__(self, kafka_bin: str, logger: logging.Logger):
-        self.kafka_bin = kafka_bin
+    def __init__(self, config: Dict, cluster_manager, logger: logging.Logger):
+        self.config = config
+        self.cluster_manager = cluster_manager
         self.logger = logger
-        self.kafka_stop_script = f"{kafka_bin}/kafka-server-stop.sh"
-        self.kafka_start_script = f"{kafka_bin}/kafka-server-start.sh"
+        
+        # Auto-detect kafka_log_dir from kafka-log-dirs.sh
+        self.kafka_log_dir = self._auto_detect_kafka_log_dir()
+        if not self.kafka_log_dir:
+            # Fallback to config or default
+            self.kafka_log_dir = config.get('kafka_log_dir', '/data/kafka-logs')
+            self.logger.info(f"Using kafka_log_dir from config/default: {self.kafka_log_dir}")
+        
+        self.meta_properties_path = os.path.join(self.kafka_log_dir, 'meta.properties')
+        
+        # Ambari configuration (mandatory)
+        self.ambari_host = config.get('ambari_host')
+        self.ambari_user = config.get('ambari_user')
+        self.ambari_password = config.get('ambari_password')
+        self.ambari_cluster = config.get('ambari_cluster')
+        self.ambari_timeout = config.get('ambari_timeout', 300)
+        
+        self.logger.info(f"Broker operations will use Ambari API: {self.ambari_host}")
     
-    def stop_broker(self, config_file: Optional[str] = None) -> bool:
-        """Stop local Kafka broker using kafka-server-stop.sh."""
+    def _auto_detect_kafka_log_dir(self) -> Optional[str]:
+        """
+        Auto-detect kafka log directory from kafka-log-dirs.sh.
+        
+        This uses the ResourceMonitor to get log directories from any broker,
+        and returns the first one found (assuming all brokers use same base path).
+        
+        Returns:
+            Log directory path or None if detection failed
+        """
         try:
-            self.logger.info("="*70)
-            self.logger.info("STOPPING KAFKA BROKER")
-            self.logger.info("="*70)
+            # Get log directories from any broker
+            all_brokers_log_dirs = {}
             
-            if not os.path.exists(self.kafka_stop_script):
-                self.logger.error(f"Kafka stop script not found: {self.kafka_stop_script}")
-                return False
+            # Trigger the disk usage query which populates log dirs cache
+            self.cluster_manager.resource_monitor.get_all_broker_disk_usage()
             
-            result = subprocess.run([self.kafka_stop_script], capture_output=True, text=True, timeout=120)
+            # Get the cached log directories
+            if hasattr(self.cluster_manager.resource_monitor, '_broker_log_dirs_cache'):
+                all_brokers_log_dirs = self.cluster_manager.resource_monitor._broker_log_dirs_cache or {}
             
-            if result.stdout:
-                self.logger.info(f"Stop output: {result.stdout[:200]}")
+            # Get first available log directory from any broker
+            for broker_id, log_dirs in all_brokers_log_dirs.items():
+                if log_dirs and len(log_dirs) > 0:
+                    detected_dir = log_dirs[0]
+                    self.logger.info(f"✓ Auto-detected kafka_log_dir from broker {broker_id}: {detected_dir}")
+                    return detected_dir
             
-            self.logger.info("Waiting for broker to stop (15 seconds)...")
-            time.sleep(15)
-            
-            if self.verify_broker_stopped():
-                self.logger.info("✓ Kafka broker stopped successfully")
-                return True
-            
-            time.sleep(10)
-            if self.verify_broker_stopped():
-                self.logger.info("✓ Kafka broker stopped successfully (after additional wait)")
-                return True
-            
-            self.logger.error("✗ Broker may not have stopped properly")
-            return False
-            
-        except subprocess.TimeoutExpired:
-            self.logger.error("Timeout stopping broker (120s)")
-            return False
-        except Exception as e:
-            self.logger.error(f"Error stopping broker: {e}")
-            return False
-    
-    def start_broker(self, config_file: str, daemon_mode: bool = True) -> bool:
-        """Start local Kafka broker using kafka-server-start.sh."""
-        try:
-            self.logger.info("="*70)
-            self.logger.info("STARTING KAFKA BROKER")
-            self.logger.info("="*70)
-            
-            if not os.path.exists(self.kafka_start_script):
-                self.logger.error(f"Kafka start script not found: {self.kafka_start_script}")
-                return False
-            
-            if not os.path.exists(config_file):
-                self.logger.error(f"Server config file not found: {config_file}")
-                return False
-            
-            cmd = [self.kafka_start_script]
-            if daemon_mode:
-                cmd.append("-daemon")
-            cmd.append(config_file)
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode != 0:
-                self.logger.error(f"Start script returned error code: {result.returncode}")
-                return False
-            
-            self.logger.info("Waiting for broker to start (20 seconds)...")
-            time.sleep(20)
-            
-            if self.verify_broker_running():
-                self.logger.info("✓ Kafka broker started successfully")
-                return True
-            
-            time.sleep(15)
-            if self.verify_broker_running():
-                self.logger.info("✓ Kafka broker started successfully (after additional wait)")
-                return True
-            
-            self.logger.error("✗ Broker may not have started properly")
-            return False
+            self.logger.warning("Could not auto-detect kafka_log_dir from kafka-log-dirs.sh")
+            return None
             
         except Exception as e:
-            self.logger.error(f"Error starting broker: {e}")
+            self.logger.warning(f"Failed to auto-detect kafka_log_dir: {e}")
+            return None
+    
+    def backup_meta_properties(self, state_dir: str, broker_id: int) -> Optional[str]:
+        """
+        Backup meta.properties file before decommission.
+        
+        Returns:
+            Path to backup file, or None if backup failed
+        """
+        try:
+            if not os.path.exists(self.meta_properties_path):
+                self.logger.warning(f"meta.properties not found at {self.meta_properties_path}")
+                return None
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"meta.properties_broker_{broker_id}_{timestamp}.backup"
+            backup_path = os.path.join(state_dir, backup_filename)
+            
+            shutil.copy2(self.meta_properties_path, backup_path)
+            self.logger.info(f"✓ Backed up meta.properties to: {backup_path}")
+            
+            # Also read and log the content
+            with open(self.meta_properties_path, 'r') as f:
+                content = f.read()
+                self.logger.info(f"meta.properties content:\n{content}")
+            
+            return backup_path
+            
+        except Exception as e:
+            self.logger.error(f"Failed to backup meta.properties: {e}")
+            return None
+    
+    def restore_meta_properties(self, backup_path: str) -> bool:
+        """
+        Restore meta.properties file from backup before recommission.
+        
+        Args:
+            backup_path: Path to backup file
+            
+        Returns:
+            True if restored successfully, False otherwise
+        """
+        try:
+            if not os.path.exists(backup_path):
+                self.logger.error(f"Backup file not found: {backup_path}")
+                return False
+            
+            # Create backup of current meta.properties if it exists
+            if os.path.exists(self.meta_properties_path):
+                current_backup = f"{self.meta_properties_path}.current_backup"
+                shutil.copy2(self.meta_properties_path, current_backup)
+                self.logger.info(f"Created backup of current meta.properties: {current_backup}")
+            
+            # Restore from backup
+            shutil.copy2(backup_path, self.meta_properties_path)
+            self.logger.info(f"✓ Restored meta.properties from: {backup_path}")
+            
+            # Log the restored content
+            with open(self.meta_properties_path, 'r') as f:
+                content = f.read()
+                self.logger.info(f"Restored meta.properties content:\n{content}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to restore meta.properties: {e}")
             return False
+    
+    def _ambari_stop_broker(self, hostname: str) -> bool:
+        """Stop broker using Ambari API."""
+        try:
+            url = (f"http://{self.ambari_host}/api/v1/clusters/{self.ambari_cluster}/"
+                   f"hosts/{hostname}/host_components/KAFKA_BROKER")
+            
+            headers = {'X-Requested-By': 'ambari'}
+            payload = {
+                'RequestInfo': {'context': 'Stop Kafka Broker via Decommission Script'},
+                'Body': {'HostRoles': {'state': 'INSTALLED'}}
+            }
+            
+            self.logger.info(f"Sending stop request to Ambari: {url}")
+            response = requests.put(
+                url,
+                auth=(self.ambari_user, self.ambari_password),
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code not in [200, 201, 202]:
+                self.logger.error(f"Ambari API returned status {response.status_code}: {response.text}")
+                return False
+            
+            result = response.json()
+            request_id = result.get('Requests', {}).get('id')
+            self.logger.info(f"✓ Ambari stop request accepted: Request ID {request_id}")
+            
+            # Wait for request to complete
+            if request_id:
+                return self._wait_for_ambari_request(request_id, 'stop')
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Ambari stop broker failed: {e}")
+            return False
+    
+    def _ambari_start_broker(self, hostname: str) -> bool:
+        """Start broker using Ambari API."""
+        try:
+            url = (f"http://{self.ambari_host}/api/v1/clusters/{self.ambari_cluster}/"
+                   f"hosts/{hostname}/host_components/KAFKA_BROKER")
+            
+            headers = {'X-Requested-By': 'ambari'}
+            payload = {
+                'RequestInfo': {'context': 'Start Kafka Broker via Recommission Script'},
+                'Body': {'HostRoles': {'state': 'STARTED'}}
+            }
+            
+            self.logger.info(f"Sending start request to Ambari: {url}")
+            response = requests.put(
+                url,
+                auth=(self.ambari_user, self.ambari_password),
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code not in [200, 201, 202]:
+                self.logger.error(f"Ambari API returned status {response.status_code}: {response.text}")
+                return False
+            
+            result = response.json()
+            request_id = result.get('Requests', {}).get('id')
+            self.logger.info(f"✓ Ambari start request accepted: Request ID {request_id}")
+            
+            # Wait for request to complete
+            if request_id:
+                return self._wait_for_ambari_request(request_id, 'start')
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Ambari start broker failed: {e}")
+            return False
+    
+    def _wait_for_ambari_request(self, request_id: int, operation: str) -> bool:
+        """Wait for Ambari request to complete."""
+        try:
+            url = f"http://{self.ambari_host}/api/v1/clusters/{self.ambari_cluster}/requests/{request_id}"
+            
+            start_time = time.time()
+            check_interval = 5
+            
+            while time.time() - start_time < self.ambari_timeout:
+                response = requests.get(
+                    url,
+                    auth=(self.ambari_user, self.ambari_password),
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    request_status = result.get('Requests', {}).get('request_status')
+                    progress = result.get('Requests', {}).get('progress_percent', 0)
+                    
+                    self.logger.info(f"Ambari {operation} progress: {progress}% - Status: {request_status}")
+                    
+                    if request_status == 'COMPLETED':
+                        self.logger.info(f"✓ Ambari {operation} request completed successfully")
+                        return True
+                    elif request_status in ['FAILED', 'TIMEDOUT', 'ABORTED']:
+                        self.logger.error(f"✗ Ambari {operation} request {request_status}")
+                        return False
+                    
+                time.sleep(check_interval)
+            
+            self.logger.error(f"Timeout waiting for Ambari {operation} request ({self.ambari_timeout}s)")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error waiting for Ambari request: {e}")
+            return False
+    
+    def stop_broker(self, hostname: str) -> bool:
+        """Stop broker using Ambari API."""
+        self.logger.info("="*70)
+        self.logger.info("STOPPING KAFKA BROKER VIA AMBARI API")
+        self.logger.info("="*70)
+        
+        if not hostname:
+            self.logger.error("Hostname required for Ambari API stop")
+            return False
+        
+        self.logger.info(f"Stopping broker on {hostname} using Ambari")
+        if not self._ambari_stop_broker(hostname):
+            return False
+        
+        self.logger.info("Waiting for broker to stop (15 seconds)...")
+        time.sleep(15)
+        
+        if self.verify_broker_stopped():
+            self.logger.info("✓ Kafka broker stopped successfully")
+            return True
+        
+        self.logger.warning("⚠ Broker process check inconclusive, trusting Ambari status")
+        return True
+    
+    def start_broker(self, hostname: str) -> bool:
+        """Start broker using Ambari API."""
+        self.logger.info("="*70)
+        self.logger.info("STARTING KAFKA BROKER VIA AMBARI API")
+        self.logger.info("="*70)
+        
+        if not hostname:
+            self.logger.error("Hostname required for Ambari API start")
+            return False
+        
+        self.logger.info(f"Starting broker on {hostname} using Ambari")
+        if not self._ambari_start_broker(hostname):
+            return False
+        
+        self.logger.info("Waiting for broker to start (20 seconds)...")
+        time.sleep(20)
+        
+        if self.verify_broker_running():
+            self.logger.info("✓ Kafka broker started successfully")
+            return True
+        
+        time.sleep(15)
+        if self.verify_broker_running():
+            self.logger.info("✓ Kafka broker started successfully (after additional wait)")
+            return True
+        
+        self.logger.warning("⚠ Broker process check inconclusive, trusting Ambari status")
+        return True
     
     def verify_broker_stopped(self) -> bool:
         """Verify broker is stopped."""
@@ -510,6 +740,7 @@ class ResourceMonitor:
         self.logger = logger
         self._disk_usage_cache = None
         self._disk_usage_cache_time = None
+        self._broker_log_dirs_cache = None
     
     def get_broker_cpu_usage(self, hostname: str, hours: int = 24) -> Optional[float]:
         """Get broker CPU usage from OpenTSDB (if available)."""
@@ -546,7 +777,14 @@ class ResourceMonitor:
             if time.time() - self._disk_usage_cache_time < 60:
                 return self._disk_usage_cache
         
-        broker_usage = get_broker_disk_usage_from_kafka(self.kafka_bin, self.bootstrap_servers, self.logger)
+        broker_usage, broker_log_dirs = get_broker_disk_usage_from_kafka(
+            self.kafka_bin, self.bootstrap_servers, self.logger
+        )
+        
+        # Cache both usage and log directories
+        self._disk_usage_cache = broker_usage
+        self._broker_log_dirs_cache = broker_log_dirs
+        self._disk_usage_cache_time = time.time()
         
         if broker_usage:
             self.logger.info("Kafka data usage per broker:")
@@ -557,13 +795,27 @@ class ResourceMonitor:
                 else:
                     self.logger.info(f"  Broker {broker_id}: {usage_gb:.2f} GB")
         
-        self._disk_usage_cache = broker_usage
-        self._disk_usage_cache_time = time.time()
         return broker_usage
     
     def get_broker_disk_usage(self, broker_id: int) -> Optional[Dict[str, float]]:
         """Get disk usage for a specific broker."""
         return self.get_all_broker_disk_usage().get(broker_id)
+    
+    def get_broker_log_dirs(self, broker_id: int) -> List[str]:
+        """
+        Get log directories for a specific broker.
+        
+        Returns:
+            List of log directory paths (e.g., ['/data/kafka-logs'])
+        """
+        # Ensure we have the cache populated
+        if self._broker_log_dirs_cache is None:
+            self.get_all_broker_disk_usage()
+        
+        if self._broker_log_dirs_cache:
+            return self._broker_log_dirs_cache.get(broker_id, [])
+        
+        return []
 
 
 class KafkaClusterManager:
@@ -875,8 +1127,8 @@ class BrokerDecommissionManager:
         if self.dry_run:
             self.logger.info("🔍 DRY-RUN MODE ENABLED - No actual changes will be made")
     
-    def decommission_broker(self, broker_id: int) -> bool:
-        """Decommission broker: transfer leadership → stop broker."""
+    def decommission_broker(self, broker_id: int, hostname: Optional[str] = None) -> bool:
+        """Decommission broker: backup metadata → transfer leadership → stop broker."""
         self.logger.info("="*70)
         if self.dry_run:
             self.logger.info(f"🔍 DRY-RUN: SIMULATING BROKER DECOMMISSION FOR BROKER {broker_id}")
@@ -884,17 +1136,25 @@ class BrokerDecommissionManager:
             self.logger.info(f"STARTING BROKER DECOMMISSION FOR BROKER {broker_id}")
         self.logger.info("="*70)
         
-        hostname = self.cluster.get_broker_hostname(broker_id)
         if not hostname:
-            self.logger.error(f"Could not get hostname for broker {broker_id}")
-            return False
+            hostname = self.cluster.get_broker_hostname(broker_id)
+            if not hostname:
+                self.logger.error(f"Could not get hostname for broker {broker_id}")
+                return False
         
         self.logger.info(f"Broker {broker_id} hostname: {hostname}")
+        
+        # Backup meta.properties before decommission
+        if not self.dry_run:
+            meta_backup = self.broker_manager.backup_meta_properties(self.state_dir, broker_id)
+        else:
+            self.logger.info(f"🔍 DRY-RUN: Would backup meta.properties")
+            meta_backup = None
         
         partitions = self._find_partitions_to_transfer(broker_id)
         self.logger.info(f"Found {len(partitions)} partitions where broker {broker_id} is a replica")
         
-        state_file = self._save_decommission_state(broker_id, hostname, partitions)
+        state_file = self._save_decommission_state(broker_id, hostname, partitions, meta_backup)
         
         if partitions:
             leader_partitions = [p for p in partitions if p['leader'] == broker_id]
@@ -904,12 +1164,11 @@ class BrokerDecommissionManager:
                     return False
         
         if not self.dry_run:
-            server_config = self.config.get('kafka_server_config')
-            if not self.broker_manager.stop_broker(server_config):
+            if not self.broker_manager.stop_broker(hostname):
                 self.logger.error(f"Failed to stop broker {broker_id}")
                 return False
         else:
-            self.logger.info(f"🔍 DRY-RUN: Would stop broker {broker_id}")
+            self.logger.info(f"🔍 DRY-RUN: Would stop broker {broker_id} via Ambari")
         
         self.logger.info("="*70)
         if self.dry_run:
@@ -1077,13 +1336,15 @@ class BrokerDecommissionManager:
         except Exception:
             return False
     
-    def _save_decommission_state(self, broker_id: int, hostname: str, partitions: List[Dict]) -> str:
+    def _save_decommission_state(self, broker_id: int, hostname: str, partitions: List[Dict], 
+                                  meta_backup: Optional[str] = None) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         state_file = os.path.join(self.state_dir, f"decommission_state_broker_{broker_id}_{timestamp}.json")
         
         state = {
             'timestamp': timestamp, 'broker_id': broker_id, 'hostname': hostname,
             'partitions': partitions, 'operation': 'decommission',
+            'meta_properties_backup': meta_backup,
             'config': {'zookeeper': self.config.get('zookeeper_server'),
                       'bootstrap_servers': self.config.get('bootstrap_servers')},
             'dry_run': self.dry_run
@@ -1113,8 +1374,9 @@ class BrokerRecommissionManager:
         if self.dry_run:
             self.logger.info("🔍 DRY-RUN MODE ENABLED - No actual changes will be made")
     
-    def recommission_broker(self, broker_id: int, state_file: Optional[str] = None) -> bool:
-        """Recommission broker: start broker → wait for ISR → restore leadership."""
+    def recommission_broker(self, broker_id: int, hostname: Optional[str] = None, 
+                           state_file: Optional[str] = None) -> bool:
+        """Recommission broker: restore metadata → start broker → wait for ISR → restore leadership."""
         self.logger.info("="*70)
         if self.dry_run:
             self.logger.info(f"🔍 DRY-RUN: SIMULATING BROKER RECOMMISSION FOR BROKER {broker_id}")
@@ -1133,17 +1395,29 @@ class BrokerRecommissionManager:
         if state is None:
             return False
         
-        hostname = state.get('hostname')
+        if not hostname:
+            hostname = state.get('hostname')
         partitions = state.get('partitions', [])
+        meta_backup = state.get('meta_properties_backup')
+        
         self.logger.info(f"Broker {broker_id} hostname: {hostname}, partitions: {len(partitions)}")
         
+        # Restore meta.properties before starting broker
+        if meta_backup and not self.dry_run:
+            self.logger.info(f"Restoring meta.properties from backup")
+            if not self.broker_manager.restore_meta_properties(meta_backup):
+                self.logger.warning("Failed to restore meta.properties, continuing anyway...")
+        elif not meta_backup:
+            self.logger.info("No meta.properties backup found in state file")
+        else:
+            self.logger.info(f"🔍 DRY-RUN: Would restore meta.properties from {meta_backup}")
+        
         if not self.dry_run:
-            server_config = self.config.get('kafka_server_config')
-            if not self.broker_manager.start_broker(server_config, daemon_mode=True):
+            if not self.broker_manager.start_broker(hostname):
                 self.logger.error(f"Failed to start broker {broker_id}")
                 return False
         else:
-            self.logger.info(f"🔍 DRY-RUN: Would start broker {broker_id}")
+            self.logger.info(f"🔍 DRY-RUN: Would start broker {broker_id} via Ambari")
         
         if not self.dry_run:
             isr_timeout = self.config.get('isr_sync_timeout', 600)
@@ -1419,9 +1693,8 @@ Examples:
         logger.info("Initializing Kafka cluster manager")
         cluster_manager = KafkaClusterManager(config, logger)
         
-        logger.info("Initializing broker manager")
-        kafka_bin = config.get('kafka_bin_path')
-        broker_manager = BrokerManager(kafka_bin, logger)
+        logger.info("Initializing broker manager (Ambari API mode)")
+        broker_manager = BrokerManager(config.config, cluster_manager, logger)
         
         if args.recommission:
             logger.info("")
@@ -1441,7 +1714,7 @@ Examples:
                 cluster_manager, broker_manager, config, logger, args.dry_run
             )
             
-            success = recommission_mgr.recommission_broker(broker_id, args.state_file)
+            success = recommission_mgr.recommission_broker(broker_id, broker_hostname, args.state_file)
             
             if success:
                 if args.dry_run:
@@ -1491,7 +1764,7 @@ Examples:
                 cluster_manager, broker_manager, config, logger, args.dry_run
             )
             
-            success = decommission_mgr.decommission_broker(broker_id)
+            success = decommission_mgr.decommission_broker(broker_id, broker_hostname)
             
             if success:
                 if args.dry_run:
