@@ -355,6 +355,11 @@ class KafkaConfig:
             raise ValueError(f"Missing required Ambari configuration fields: {missing_ambari}")
         self.logger.info("✓ Ambari configuration validated")
         
+        # Validate OpenTSDB configuration (now mandatory)
+        if not self.config.get('opentsdb_url'):
+            raise ValueError("Missing required OpenTSDB configuration: opentsdb_url")
+        self.logger.info("✓ OpenTSDB configuration validated")
+        
         self.logger.info("✓ Configuration validation passed")
     
     def get(self, key: str, default=None):
@@ -730,10 +735,10 @@ class ISRMonitor:
 
 
 class ResourceMonitor:
-    """Monitor broker resources."""
+    """Monitor broker resources via OpenTSDB (mandatory)."""
     
     def __init__(self, kafka_bin: str, bootstrap_servers: str, logger: logging.Logger, 
-                 opentsdb_url: Optional[str] = None):
+                 opentsdb_url: str):
         self.kafka_bin = kafka_bin
         self.bootstrap_servers = bootstrap_servers
         self.opentsdb_url = opentsdb_url
@@ -741,18 +746,23 @@ class ResourceMonitor:
         self._disk_usage_cache = None
         self._disk_usage_cache_time = None
         self._broker_log_dirs_cache = None
-    
-    def get_broker_cpu_usage(self, hostname: str, hours: int = 24) -> Optional[float]:
-        """Get broker CPU usage from OpenTSDB (if available)."""
-        if not self.opentsdb_url:
-            return None
         
+        if not self.opentsdb_url:
+            raise ValueError("OpenTSDB URL is required for resource monitoring")
+    
+    def get_broker_cpu_usage(self, hostname: str, hours: int = 1) -> float:
+        """
+        Get broker CPU usage from OpenTSDB (mandatory).
+        
+        Returns:
+            CPU usage percentage (0-100)
+        """
         try:
             query = {
                 "start": f"{hours}h-ago",
                 "queries": [{
                     "metric": "cpu.field.usage_idle",
-                    "aggregator": "min",
+                    "aggregator": "avg",
                     "tags": {"node_host": hostname, "cpu": "cpu-total"}
                 }]
             }
@@ -764,36 +774,113 @@ class ResourceMonitor:
             
             data = response.json()
             if data and data[0].get('dps'):
-                min_idle = min(data[0]['dps'].values())
-                return 100.0 - min_idle
-            return None
+                # Get average idle percentage
+                values = list(data[0]['dps'].values())
+                avg_idle = sum(values) / len(values)
+                cpu_usage = 100.0 - avg_idle
+                self.logger.debug(f"CPU usage for {hostname}: {cpu_usage:.2f}%")
+                return cpu_usage
             
-        except Exception:
-            return None
+            self.logger.warning(f"No CPU data from OpenTSDB for {hostname}, returning 0")
+            return 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error getting CPU usage from OpenTSDB for {hostname}: {e}")
+            return 0.0
+    
+    def get_broker_disk_usage_percent(self, hostname: str, path: str, hours: int = 1) -> float:
+        """
+        Get broker disk usage percentage from OpenTSDB (mandatory).
+        
+        Args:
+            hostname: Broker hostname (e.g., stg-hdpashique101.phonepe.nb6)
+            path: Disk path (e.g., /data)
+            hours: Hours to look back
+            
+        Returns:
+            Disk usage percentage (0-100)
+        """
+        try:
+            query = {
+                "start": f"{hours}h-ago",
+                "queries": [{
+                    "metric": "disk.field.used_percent",
+                    "aggregator": "avg",
+                    "tags": {
+                        "node_host": hostname,
+                        "path": path
+                    }
+                }]
+            }
+            
+            response = requests.post(f"{self.opentsdb_url}/api/query",
+                                    headers={'Content-Type': 'application/json'},
+                                    json=query, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data and data[0].get('dps'):
+                # Get average disk usage percentage
+                values = list(data[0]['dps'].values())
+                avg_disk_percent = sum(values) / len(values)
+                self.logger.debug(f"Disk usage for {hostname}:{path}: {avg_disk_percent:.2f}%")
+                return avg_disk_percent
+            
+            self.logger.warning(f"No disk data from OpenTSDB for {hostname}:{path}, returning 0")
+            return 0.0
+            
+        except Exception as e:
+            self.logger.error(f"Error getting disk usage from OpenTSDB for {hostname}:{path}: {e}")
+            return 0.0
     
     def get_all_broker_disk_usage(self, disk_threshold: float = 85.0) -> Dict[int, Dict[str, float]]:
-        """Get disk usage for all brokers."""
+        """
+        Get disk usage for all brokers using OpenTSDB.
+        
+        This combines:
+        1. Log directories from kafka-log-dirs.sh
+        2. Disk usage percentages from OpenTSDB
+        """
         if self._disk_usage_cache and self._disk_usage_cache_time:
             if time.time() - self._disk_usage_cache_time < 60:
                 return self._disk_usage_cache
         
-        broker_usage, broker_log_dirs = get_broker_disk_usage_from_kafka(
+        # Get log directories and Kafka data size from kafka-log-dirs.sh
+        kafka_usage, broker_log_dirs = get_broker_disk_usage_from_kafka(
             self.kafka_bin, self.bootstrap_servers, self.logger
         )
         
-        # Cache both usage and log directories
-        self._disk_usage_cache = broker_usage
+        # Cache log directories
         self._broker_log_dirs_cache = broker_log_dirs
+        
+        broker_usage = {}
+        
+        # For each broker, get disk usage from OpenTSDB
+        for broker_id, log_dirs in broker_log_dirs.items():
+            if not log_dirs:
+                self.logger.warning(f"No log directories found for broker {broker_id}")
+                continue
+            
+            # Get the first log directory (e.g., /data/kafka-logs)
+            log_dir = log_dirs[0]
+            
+            # Extract base path (e.g., /data from /data/kafka-logs)
+            base_path = '/' + log_dir.split('/')[1] if '/' in log_dir else '/data'
+            
+            # Store basic info - hostname-based queries will be done later when needed
+            broker_usage[broker_id] = {
+                'total_bytes': kafka_usage.get(broker_id, {}).get('total_bytes', 0),
+                'usage_gb': kafka_usage.get(broker_id, {}).get('usage_gb', 0.0),
+                'usage_percent': 0.0,  # Will be filled in by get_broker_resources_with_hostnames
+                'log_dir': log_dir,
+                'base_path': base_path
+            }
+        
+        self._disk_usage_cache = broker_usage
         self._disk_usage_cache_time = time.time()
         
         if broker_usage:
-            self.logger.info("Kafka data usage per broker:")
-            for broker_id, usage in sorted(broker_usage.items()):
-                usage_gb = usage.get('usage_gb', 0)
-                if usage_gb < 1.0:
-                    self.logger.info(f"  Broker {broker_id}: {usage_gb*1024:.0f} MB")
-                else:
-                    self.logger.info(f"  Broker {broker_id}: {usage_gb:.2f} GB")
+            self.logger.info(f"Found {len(broker_usage)} brokers with log directories")
         
         return broker_usage
     
@@ -816,6 +903,35 @@ class ResourceMonitor:
             return self._broker_log_dirs_cache.get(broker_id, [])
         
         return []
+    
+    def get_broker_resources_with_hostname(self, broker_id: int, hostname: str) -> Dict[str, float]:
+        """
+        Get complete resource information for a broker (CPU and disk from OpenTSDB).
+        
+        Args:
+            broker_id: Broker ID
+            hostname: Broker hostname
+            
+        Returns:
+            Dictionary with cpu_usage, disk_usage_percent, disk_usage_gb, base_path
+        """
+        # Get base disk info
+        disk_info = self.get_broker_disk_usage(broker_id) or {}
+        base_path = disk_info.get('base_path', '/data')
+        
+        # Get CPU usage from OpenTSDB
+        cpu_usage = self.get_broker_cpu_usage(hostname)
+        
+        # Get disk usage percentage from OpenTSDB
+        disk_usage_percent = self.get_broker_disk_usage_percent(hostname, base_path)
+        
+        return {
+            'cpu_usage': cpu_usage,
+            'disk_usage_percent': disk_usage_percent,
+            'disk_usage_gb': disk_info.get('usage_gb', 0.0),
+            'base_path': base_path,
+            'log_dir': disk_info.get('log_dir', '')
+        }
 
 
 class KafkaClusterManager:
@@ -1218,23 +1334,31 @@ class BrokerDecommissionManager:
         return True
     
     def _get_brokers_resource_info(self, broker_ids: Set[int]) -> Dict[int, Dict]:
-        all_disk_usage = self.cluster.resource_monitor.get_all_broker_disk_usage()
+        """Get resource information for brokers using OpenTSDB."""
+        # Initialize disk usage cache
+        self.cluster.resource_monitor.get_all_broker_disk_usage()
+        
         brokers_info = {}
         
         for broker_id in broker_ids:
             hostname = self.cluster.get_broker_hostname(broker_id)
             if not hostname:
+                self.logger.warning(f"Could not get hostname for broker {broker_id}")
                 continue
             
-            cpu_usage = self.cluster.resource_monitor.get_broker_cpu_usage(hostname)
-            disk_info = all_disk_usage.get(broker_id, {})
+            # Get complete resource info from OpenTSDB (CPU + Disk)
+            resources = self.cluster.resource_monitor.get_broker_resources_with_hostname(broker_id, hostname)
             
             brokers_info[broker_id] = {
                 'hostname': hostname,
-                'cpu_usage': cpu_usage if cpu_usage is not None else 0.0,
-                'disk_usage': disk_info.get('usage_percent', 100.0),
-                'disk_usage_gb': disk_info.get('usage_gb', 0.0)
+                'cpu_usage': resources['cpu_usage'],
+                'disk_usage': resources['disk_usage_percent'],
+                'disk_usage_gb': resources['disk_usage_gb'],
+                'base_path': resources['base_path']
             }
+            
+            self.logger.info(f"Broker {broker_id} ({hostname}): CPU={resources['cpu_usage']:.1f}%, Disk={resources['disk_usage_percent']:.1f}%")
+        
         return brokers_info
     
     def _create_reassignment_json(self, partitions: List[Dict], brokers_info: Dict[int, Dict],
@@ -1245,11 +1369,15 @@ class BrokerDecommissionManager:
         
         reassignment = {"version": 1, "partitions": []}
         new_leaders = {}
+        broker_selection_count = {}  # Track how many partitions assigned to each broker
         
         for part in partitions:
             new_leader = self._select_best_replica(part['replicas'], exclude_broker, brokers_info)
             if new_leader is None:
                 return None, {}
+            
+            # Track broker selection
+            broker_selection_count[new_leader] = broker_selection_count.get(new_leader, 0) + 1
             
             new_replicas = [new_leader] + [r for r in part['replicas'] if r != new_leader]
             reassignment["partitions"].append({
@@ -1261,9 +1389,20 @@ class BrokerDecommissionManager:
         with open(reassignment_file, 'w') as f:
             json.dump(reassignment, f, indent=2)
         
+        # Log summary of broker selection
+        self.logger.info(f"Leadership reassignment summary for {len(partitions)} partitions:")
+        for broker_id in sorted(broker_selection_count.keys()):
+            count = broker_selection_count[broker_id]
+            info = brokers_info.get(broker_id, {})
+            hostname = info.get('hostname', 'unknown')
+            cpu = info.get('cpu_usage', 0)
+            disk = info.get('disk_usage', 0)
+            self.logger.info(f"  Broker {broker_id} ({hostname}): {count} partitions (CPU={cpu:.1f}%, Disk={disk:.1f}%)")
+        
         return reassignment_file, new_leaders
     
     def _select_best_replica(self, replicas: List[int], exclude_broker: int, brokers_info: Dict[int, Dict]) -> Optional[int]:
+        """Select best replica based on CPU and disk usage from OpenTSDB (both mandatory)."""
         cpu_threshold = self.config.get('cpu_threshold', 80.0)
         disk_threshold = self.config.get('disk_threshold', 85.0)
         
@@ -1272,22 +1411,27 @@ class BrokerDecommissionManager:
         
         for broker_id in candidates:
             info = brokers_info.get(broker_id, {})
-            cpu = info.get('cpu_usage', 0.0)
+            cpu_usage = info.get('cpu_usage', 100.0)  # Default to high if missing
+            disk_percent = info.get('disk_usage', 100.0)  # Default to high if missing
             disk_usage_gb = info.get('disk_usage_gb', 0.0)
-            disk_percent = info.get('disk_usage', 0.0)
             
-            disk_ok = disk_percent == 0 or disk_percent < disk_threshold
-            if cpu == 0.0:
-                if disk_ok:
-                    eligible.append((broker_id, 50.0, disk_usage_gb))
-            elif cpu < cpu_threshold and disk_ok:
-                eligible.append((broker_id, cpu, disk_usage_gb))
+            # Both CPU and disk must be below thresholds
+            if cpu_usage < cpu_threshold and disk_percent < disk_threshold:
+                eligible.append((broker_id, cpu_usage, disk_percent, disk_usage_gb))
+                self.logger.debug(f"Broker {broker_id} eligible: CPU={cpu_usage:.1f}%, Disk={disk_percent:.1f}%")
+            else:
+                self.logger.debug(f"Broker {broker_id} not eligible: CPU={cpu_usage:.1f}% (limit {cpu_threshold}), Disk={disk_percent:.1f}% (limit {disk_threshold})")
         
         if not eligible:
+            self.logger.warning(f"No eligible brokers found below thresholds (CPU<{cpu_threshold}%, Disk<{disk_threshold}%)")
+            self.logger.warning(f"Falling back to first candidate")
             return candidates[0] if candidates else None
         
-        eligible.sort(key=lambda x: (x[1], x[2]))
-        return eligible[0][0]
+        # Sort by CPU first, then disk percentage, then disk GB
+        eligible.sort(key=lambda x: (x[1], x[2], x[3]))
+        selected = eligible[0]
+        self.logger.debug(f"Selected broker {selected[0]}: CPU={selected[1]:.1f}%, Disk={selected[2]:.1f}%")
+        return selected[0]
     
     def _execute_reassignment(self, reassignment_file: str) -> bool:
         if self.dry_run:
